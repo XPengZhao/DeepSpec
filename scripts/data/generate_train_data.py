@@ -1,4 +1,10 @@
 import argparse
+import hashlib
+import fcntl
+from collections import Counter, defaultdict
+from pathlib import Path
+import signal
+from threading import Event
 import json
 import os
 import random
@@ -144,18 +150,96 @@ def call_sglang(args, server_address, sample, max_tokens=None):
     return sample
 
 
-def count_lines(path):
-    with open(path, "r", encoding="utf-8") as handle:
-        return sum(1 for _ in handle)
+RESUME_KEY = "_regen"
 
 
-def find_resume_offset(output_path, error_path):
-    if not os.path.exists(output_path):
-        return 0, 0, 0
+def fingerprint(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                    separators=(",", ":")).encode()).hexdigest()
 
-    success_count = count_lines(output_path)
-    error_count = count_lines(error_path) if os.path.exists(error_path) else 0
-    return success_count + error_count, success_count, error_count
+
+def prompt_fingerprint(sample):
+    # Old outputs preserve source metadata and system/user turns, but replace assistants.
+    value = {k: v for k, v in sample.items()
+             if k not in ("conversations", "status", "error", RESUME_KEY)}
+    value["conversations"] = [m for m in sample.get("conversations", [])
+                              if m.get("role") != "assistant"]
+    return fingerprint(value)
+
+
+def source_rows(path):
+    occurrences = Counter()
+    with open(path, encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            sample = json.loads(line)
+            if not isinstance(sample, dict) or RESUME_KEY in sample:
+                raise ValueError(f"Invalid source or reserved {RESUME_KEY} field at line {line_number}")
+            digest = fingerprint(sample)
+            occurrence = occurrences[digest]
+            occurrences[digest] += 1
+            key = f"{digest}:{occurrence}"
+            yield key, line_number, sample
+
+
+def read_output_rows(path):
+    """Never truncate existing results automatically, including a partial last line."""
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as handle:
+        for number, line in enumerate(handle, 1):
+            try:
+                sample = json.loads(line)
+                if not isinstance(sample, dict):
+                    raise ValueError("expected a JSON object")
+            except ValueError as exc:
+                raise ValueError(f"Invalid JSONL at {path}:{number}; preserve/repair this line before resuming") from exc
+            yield sample
+
+
+def find_completed_samples(input_path, output_path):
+    """Match successful rows by source identity, never by completion order or line count."""
+    expected = {}
+    legacy_candidates = defaultdict(list)
+    for key, _, sample in source_rows(input_path):
+        prompt = prompt_fingerprint(sample)
+        expected[key] = prompt
+        legacy_candidates[prompt].append(key)
+    completed = set()
+    legacy_counts = Counter()
+    for sample in read_output_rows(output_path):
+        if sample.get("status") != "success":
+            continue
+        prompt = prompt_fingerprint(sample)
+        meta = sample.get(RESUME_KEY)
+        if meta is None:
+            legacy_counts[prompt] += 1
+            continue
+        if not isinstance(meta, dict) or meta.get("version") != 1:
+            raise ValueError("Unsupported regen resume metadata")
+        key = meta.get("source_key")
+        if key not in expected or expected[key] != prompt:
+            raise ValueError("Output does not match the current input dataset; use the original input")
+        if key in completed:
+            raise ValueError(f"Duplicate successful source key in output: {key}")
+        completed.add(key)
+    for prompt, count in legacy_counts.items():
+        candidates = legacy_candidates.get(prompt, [])
+        if not candidates:
+            raise ValueError("Legacy output cannot be matched to this input dataset")
+        if len(candidates) != 1 or count != 1 or candidates[0] in completed:
+            raise ValueError("Ambiguous/duplicate legacy output: preserved prompts and metadata do not identify a unique source row; reconcile before resuming")
+        completed.add(candidates[0])
+    return completed, len(expected)
+
+
+def ensure_append_boundary(path):
+    # A valid final JSON object may have no newline. Keep it, but delimit the next row.
+    if os.path.exists(path) and os.path.getsize(path):
+        with open(path, "rb+") as handle:
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) != b"\n":
+                handle.seek(0, os.SEEK_END)
+                handle.write(b"\n")
 
 
 def validate_server(args, server_address, probe):
@@ -239,6 +323,7 @@ def write_finished_result(
     sample = future.result()
     if sample["status"] == "error":
         error_handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
+        error_handle.flush()
         stats["errors"] += 1
         return
 
@@ -252,6 +337,7 @@ def write_finished_result(
     stats["context_max"] = max(stats["context_max"], context_length)
     stats["success"] += 1
     output_handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
+    output_handle.flush()
 
 
 def print_config(args):
@@ -269,32 +355,30 @@ def print_config(args):
     print(f"  resume: {args.resume}")
 
 
-def main():
-    args = parse_args()
-    validate_args(args)
+def run(args, stop_requested=None):
+    stop_requested = stop_requested if stop_requested is not None else Event()
     print_config(args)
-
-    total_lines = count_lines(args.input_file_path)
-    error_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
-    skip_lines, existing_success, existing_errors = (
-        find_resume_offset(args.output_file_path, error_path)
-        if args.resume
-        else (0, 0, 0)
+    error_path = str(Path(args.output_file_path).with_suffix("")) + "_error.jsonl"
+    completed, total_lines = find_completed_samples(
+        args.input_file_path, args.output_file_path if args.resume else os.devnull
     )
-    if skip_lines >= total_lines:
-        print(f"All {total_lines} samples are already processed.")
+    if args.resume:
+        # Failed attempts are history, not completed samples; retry them automatically.
+        for _ in read_output_rows(error_path):
+            pass
+        print(f"Resume: {len(completed)} successful source rows; "
+              f"{total_lines - len(completed)} pending (including errors)")
+    if len(completed) == total_lines:
+        print(f"All {total_lines} samples succeeded.")
         return
-
-    if args.resume and skip_lines > 0:
-        print(
-            "Resume mode: "
-            f"{existing_success} success, {existing_errors} errors, skip {skip_lines}"
-        )
 
     valid_servers = validate_servers(args)
     print(f"Using servers: {valid_servers}")
 
-    file_mode = "a" if args.resume and skip_lines > 0 else "w"
+    file_mode = "a" if args.resume else "w"
+    if args.resume:
+        ensure_append_boundary(args.output_file_path)
+        ensure_append_boundary(error_path)
     stats = {
         "success": 0,
         "errors": 0,
@@ -307,52 +391,51 @@ def main():
     submitted_count = 0
 
     with (
-        open(args.input_file_path, "r", encoding="utf-8") as input_handle,
         open(args.output_file_path, file_mode, encoding="utf-8") as output_handle,
         open(error_path, file_mode, encoding="utf-8") as error_handle,
         ThreadPoolExecutor(max_workers=args.concurrency * len(valid_servers)) as executor,
     ):
-        for _ in range(skip_lines):
-            next(input_handle, None)
+        pending = total_lines - len(completed)
+        progress_total = pending if args.num_samples is None else min(pending, args.num_samples)
+        progress = tqdm(total=progress_total, desc="Completed")
 
-        progress_total = (
-            total_lines
-            if args.num_samples is None
-            else min(total_lines, skip_lines + args.num_samples)
-        )
-        progress = tqdm(total=progress_total, initial=skip_lines, desc="Processing")
-        for line in input_handle:
-            if args.num_samples is not None and submitted_count >= args.num_samples:
-                break
-
-            sample = json.loads(line)
-            server_address = valid_servers[next_server_index]
-            next_server_index = (next_server_index + 1) % len(valid_servers)
-
-            while len(queues[server_address]) >= args.concurrency:
-                wrote_result = False
-                for future in list(queues[server_address]):
-                    if future.done():
-                        write_finished_result(
-                            future, output_handle, error_handle, stats
-                        )
-                        queues[server_address].remove(future)
-                        wrote_result = True
-                        break
-                if not wrote_result:
-                    time.sleep(0.05)
-
-            future = executor.submit(call_sglang, args, server_address, sample)
-            queues[server_address].append(future)
-            submitted_count += 1
+        def finish(future):
+            write_finished_result(future, output_handle, error_handle, stats)
             progress.update(1)
 
-        for server_address in valid_servers:
-            for future in queues[server_address]:
-                write_finished_result(future, output_handle, error_handle, stats)
-        progress.close()
+        try:
+            for key, line_number, sample in source_rows(args.input_file_path):
+                if stop_requested.is_set():
+                    break
+                if key in completed:
+                    continue
+                if args.num_samples is not None and submitted_count >= args.num_samples:
+                    break
+                server_address = valid_servers[next_server_index]
+                next_server_index = (next_server_index + 1) % len(valid_servers)
+                while len(queues[server_address]) >= args.concurrency and not stop_requested.is_set():
+                    for future in list(queues[server_address]):
+                        if future.done():
+                            finish(future)
+                            queues[server_address].remove(future)
+                    if len(queues[server_address]) >= args.concurrency:
+                        time.sleep(0.05)
+                if stop_requested.is_set():
+                    break
+                sample[RESUME_KEY] = {"version": 1, "source_key": key, "source_line": line_number}
+                future = executor.submit(call_sglang, args, server_address, sample)
+                queues[server_address].append(future)
+                submitted_count += 1
+        except KeyboardInterrupt:
+            print("Stopping submission; waiting for in-flight samples and saving their results...", flush=True)
+        finally:
+            # Ctrl+C/SIGTERM drains submitted work before closing files.
+            for server_address in valid_servers:
+                for future in queues[server_address]:
+                    finish(future)
+            progress.close()
 
-    print("Processing completed.")
+    print("Stopped; submitted work saved." if stop_requested.is_set() else "Processing completed.")
     print(f"  success: {stats['success']}")
     print(f"  errors: {stats['errors']}")
     if stats["success"] > 0:
@@ -360,6 +443,39 @@ def main():
         print(f"  context_min: {stats['context_min']}")
         print(f"  context_max: {stats['context_max']}")
         print(f"  context_avg: {avg_context:.2f}")
+
+
+def main():
+    args = parse_args()
+    validate_args(args)
+    if args.num_samples is not None and args.num_samples < 0:
+        raise ValueError("num-samples must be nonnegative")
+    output = Path(args.output_file_path).resolve()
+    source = Path(args.input_file_path).resolve()
+    error = output.with_suffix("").with_name(output.stem + "_error.jsonl")
+    if source in (output, error):
+        raise ValueError("Input and output/error paths must be different")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Prevent two regen jobs from appending to the same output simultaneously.
+    with open(str(output) + ".lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError(f"Another regen job owns {output}") from None
+        stop_requested = Event()
+
+        def request_stop(*_):
+            if not stop_requested.is_set():
+                print("Stop requested; draining in-flight samples before exit...", flush=True)
+            stop_requested.set()
+
+        previous = {sig: signal.signal(sig, request_stop)
+                    for sig in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            run(args, stop_requested)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
 
 
 if __name__ == "__main__":
