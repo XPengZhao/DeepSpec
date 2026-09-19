@@ -135,3 +135,9 @@ bash scripts/data/prepare_data.sh
 ```
 
 Use the manual commands above if you want to stop and restart services between stages, change sampling parameters, use fewer GPUs, or inspect intermediate outputs.
+
+## Qwen3.8-Flash-Next hidden-state cache
+
+See [Qwen3.8 cache capture](qwen38-target-cache.md) for the single-process, multi-GPU
+BF16 capture entry point. It stores full sequences with last-three-layer aux
+features reduced by the mean of four residual streams.

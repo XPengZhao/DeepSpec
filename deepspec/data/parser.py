@@ -13,6 +13,8 @@ class ChatTemplate:
     system_prompt: str | None
     end_of_turn_token: str | None
     assistant_loss_prefix: str | None = None
+    enable_thinking: bool | None = None
+    ignored_assistant_prefix: str = ""
 
 
 class TemplateRegistry:
@@ -36,6 +38,18 @@ TEMPLATE_REGISTRY.register(
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>\n",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    "qwen38_non_thinking",
+    ChatTemplate(
+        assistant_header="<|im_start|>assistant\n",
+        user_header="<|im_start|>user\n",
+        system_prompt=None,
+        end_of_turn_token="<|im_end|>\n",
+        enable_thinking=False,
+        ignored_assistant_prefix="<think>\n\n</think>\n\n",
     ),
 )
 
@@ -70,6 +84,8 @@ class GeneralParser:
         conversation,
         max_length,
     ):
+        if self.chat_template.enable_thinking is False:
+            return self._parse_non_thinking(conversation, max_length)
         messages = []
         if conversation[0]["role"] == "system":
             warnings.warn(
@@ -98,6 +114,7 @@ class GeneralParser:
             self.tokenizer,
             render_messages,
             add_generation_prompt=False,
+            enable_thinking=self.chat_template.enable_thinking,
         )
 
         encoding = self.tokenizer(
@@ -119,6 +136,9 @@ class GeneralParser:
                 content_start_char,
             ):
                 content_start_char += len(self.assistant_loss_prefix)
+            ignored_prefix = self.chat_template.ignored_assistant_prefix
+            if ignored_prefix and conversation_text.startswith(ignored_prefix, content_start_char):
+                content_start_char += len(ignored_prefix)
             content_end_char = match.end(1)
             prefix_ids = self.tokenizer.encode(
                 conversation_text[:content_start_char],
@@ -142,6 +162,45 @@ class GeneralParser:
             "attention_mask": attention_mask,
             "loss_mask": loss_mask,
         }
+
+    def _parse_non_thinking(self, messages, max_length):
+        # Derive supervision from structured messages, never role markers inside text.
+        if not messages or any(m.get("role") not in {"system", "user", "assistant"}
+                               or not isinstance(m.get("content"), str) for m in messages):
+            raise ValueError("Qwen3.8 capture expects non-empty text-only conversations")
+        for i, message in enumerate(messages):
+            if message.get("tool_calls") or message.get("reasoning_content"):
+                raise ValueError("Expected non-thinking regen without tools or reasoning_content")
+            if message["role"] == "system" and i != 0:
+                raise ValueError("System messages must precede the conversation")
+        turns = messages[1:] if messages[0]["role"] == "system" else messages
+        if not turns or any(m["role"] != ("user" if i % 2 == 0 else "assistant")
+                            for i, m in enumerate(turns)):
+            raise ValueError("Expected alternating user/assistant regen turns")
+        def render(part, generate=False):
+            return render_chat_messages(self.tokenizer, part,
+                                        add_generation_prompt=generate, enable_thinking=False)
+        text = render(messages)
+        encoding = self.tokenizer(text, max_length=max_length, truncation=True,
+                                  return_tensors="pt", add_special_tokens=False,
+                                  return_offsets_mapping=True)
+        ids, attention = encoding.input_ids[0], encoding.attention_mask[0]
+        offsets = encoding.offset_mapping[0].tolist()
+        mask = torch.zeros(len(ids), dtype=torch.long)
+        for i, message in enumerate(messages):
+            if message["role"] != "assistant":
+                continue
+            prefix, completed = render(messages[:i], True), render(messages[:i + 1])
+            if not completed.startswith(prefix) or not text.startswith(completed):
+                raise ValueError("Chat template changed an earlier prefix; cannot align response mask")
+            start, end = len(prefix), len(completed)
+            for token, (left, right) in enumerate(offsets):
+                if right <= left or right <= start or left >= end:
+                    continue
+                if left < start or right > end:
+                    raise ValueError("Token crosses prompt/response boundary; inspect tokenizer offsets")
+                mask[token] = 1
+        return {"input_ids": ids, "attention_mask": attention, "loss_mask": mask}
 
     def _prepare_render_messages(self, messages):
         if not self.assistant_loss_prefix:

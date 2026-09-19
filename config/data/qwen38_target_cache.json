@@ -1,0 +1,13 @@
+{
+  "target_model_name_or_path": "/public/llm_models/Qwen/Qwen3.8-Flash-Next",
+  "target_layer_ids": [
+    45,
+    46,
+    47
+  ],
+  "chat_template": "qwen38_non_thinking",
+  "max_length": 4096,
+  "min_loss_tokens": 14,
+  "seed": 42,
+  "capture_ngram": true
+}

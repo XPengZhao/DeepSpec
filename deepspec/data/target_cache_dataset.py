@@ -613,10 +613,11 @@ def cleanup_target_cache_tmp_dir(output_dir: str):
 
 
 class CacheDataset(torch.utils.data.Dataset):
-    def __init__(self, cache_dir: str, max_open_shards: int = 4):
+    def __init__(self, cache_dir: str, max_open_shards: int = 4, *, manifest=None):
         super().__init__()
         self.cache_dir = os.path.abspath(cache_dir)
-        self.manifest = load_target_cache_manifest(self.cache_dir)
+        self.manifest = load_target_cache_manifest(self.cache_dir) if manifest is None else manifest
+        validate_target_cache_manifest(manifest=self.manifest, cache_dir=self.cache_dir)
         self.num_samples = int(self.manifest["num_samples"])
         self.hidden_size = int(self.manifest["hidden_size"])
         self.target_layer_ids = [int(layer_id) for layer_id in self.manifest["target_layer_ids"]]
